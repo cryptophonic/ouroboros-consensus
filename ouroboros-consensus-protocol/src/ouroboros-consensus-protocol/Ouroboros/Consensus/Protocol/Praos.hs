@@ -29,6 +29,7 @@ module Ouroboros.Consensus.Protocol.Praos
     -- * For testing purposes
   , doValidateKESSignature
   , doValidateVRFSignature
+  , validateIssuerIsLocalPool
   ) where
 
 import Cardano.Binary (FromCBOR (..), ToCBOR (..), enforceSize)
@@ -119,6 +120,9 @@ import Ouroboros.Consensus.Util.Versioned
   , decodeVersion
   , encodeVersion
   )
+import Cardano.Crypto.Hash (hashFromBytes)
+import Cardano.ForkMode (blockEvery, forkedBefore, localPoolId)
+import Cardano.Ledger.Hashes (KeyHash (KeyHash))
 
 data Praos c
 
@@ -380,6 +384,10 @@ data PraosValidationErr c
       !String -- error message given by Consensus Layer
   | NoCounterForKeyHashOCERT
       !(KeyHash SL.BlockIssuer) -- stake pool key hash
+  | -- | Fork mode only: past the fork slot the header issuer's cold key hash was
+    -- not the configured local pool (@CARDANO_FORK_POOL_ID@).
+    IssuerNotLocalPool
+      !(KeyHash SL.BlockIssuer) -- actual header issuer cold key hash
   deriving Generic
 
 deriving instance PraosCrypto c => Eq (PraosValidationErr c)
@@ -407,7 +415,7 @@ instance PraosCrypto c => ConsensusProtocol (Praos c) where
       }
     slot
     cs =
-      if meetsLeaderThreshold cfg lv (SL.coerceKeyRole vkhCold) rho
+      if isLeader
         then
           Just
             PraosIsLeader
@@ -421,7 +429,16 @@ instance PraosCrypto c => ConsensusProtocol (Praos c) where
       vkhCold = SL.hashKey praosCanBeLeaderColdVerKey
       rho' = mkInputVRF slot eta0
 
+      -- The VRF is always evaluated: its output ('rho') seeds the block nonce
+      -- via 'praosIsLeaderVrfRes' regardless of how leadership is decided.
       rho = VRF.evalCertified () rho' praosCanBeLeaderSignKeyVRF
+
+      -- Past the fork slot leadership is on a fixed slot schedule, ignoring the
+      -- stake threshold; at or below it the normal VRF stake-threshold check
+      -- applies unchanged.
+      isLeader
+        | forkedBefore slot = unSlotNo slot `mod` blockEvery == 0
+        | otherwise = meetsLeaderThreshold cfg lv (SL.coerceKeyRole vkhCold) rho
 
   -- Updating the chain dependent state for Praos.
   --
@@ -483,7 +500,16 @@ instance PraosCrypto c => ConsensusProtocol (Praos c) where
       validateKESSignature cfg lv (praosStateOCertCounters cs) b
       -- Then we examing the VRF proof, which confirms that they have the
       -- right to issue in this slot.
-      validateVRFSignature (praosStateEpochNonce cs) lv praosLeaderF b
+      --
+      -- Past the fork slot this stake-eligibility check is skipped: it looks the
+      -- issuer up in the pool distribution and rejects an unregistered issuer
+      -- with 'VRFKeyUnknown', which is exactly the block-issuer we want to accept
+      -- on a private fork. In its place we require the header to be issued by the
+      -- configured local pool. At or below the fork slot the stock VRF check runs
+      -- unchanged.
+      if forkedBefore (Views.hvSlotNo b)
+        then validateIssuerIsLocalPool (hashKey (Views.hvVK b))
+        else validateVRFSignature (praosStateEpochNonce cs) lv praosLeaderF b
       -- Finally, we apply the changes from this header to the chain state.
       pure $ reupdateChainDepState cfg b slot tcs
      where
@@ -599,6 +625,30 @@ doValidateVRFSignature eta0 pd f b = do
   vrfLeaderVal = vrfLeaderValue (Proxy @c) vrfCert
   slot = Views.hvSlotNo b
 
+-- | Past the fork slot, require the header to be issued by the configured local
+-- pool: the issuer's cold key hash must equal 'localPoolId'. This replaces the
+-- VRF stake-eligibility check that is skipped past the fork slot. Fails loudly
+-- when no local pool id is configured, since past the fork slot fork mode has no
+-- stock behaviour to fall back to.
+--
+-- Takes the issuer cold key hash directly (the header validator passes
+-- @'hashKey' ('Views.hvVK' b)@) so that it does not depend on the rest of the
+-- header.
+validateIssuerIsLocalPool ::
+  KeyHash SL.BlockIssuer ->
+  Except (PraosValidationErr c) ()
+validateIssuerIsLocalPool issuer =
+  case expectedIssuer of
+    Nothing ->
+      error
+        "Cardano.ForkMode: CARDANO_FORK_POOL_ID must be set for slots past the fork slot"
+    Just localPool ->
+      if issuer == localPool
+        then pure ()
+        else throwError $ IssuerNotLocalPool issuer
+ where
+  expectedIssuer = KeyHash <$> (localPoolId >>= hashFromBytes)
+
 validateKESSignature ::
   PraosCrypto c =>
   ConsensusConfig (Praos c) ->
@@ -660,6 +710,11 @@ doValidateKESSignature praosMaxKESEvo praosSlotsPerKESPeriod stakeDistribution o
     | r@Just{} <- Map.lookup hk ocertCounters =
         r
     | Map.member (coerceKeyRole hk) stakeDistribution =
+        Just 0
+    -- Past the fork slot a first-time, unregistered issuer has no prior counter
+    -- and is absent from the stake distribution; treat it as counter 0 so the
+    -- KES ocert-counter check tolerates it rather than failing NoCounterForKeyHash.
+    | forkedBefore (Views.hvSlotNo b) =
         Just 0
     | otherwise =
         Nothing
