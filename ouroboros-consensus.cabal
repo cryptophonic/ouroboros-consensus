@@ -972,6 +972,7 @@ library protocol
     base,
     cardano-binary,
     cardano-crypto-class:cardano-crypto-class,
+    cardano-fork-mode,
     cardano-ledger-binary,
     cardano-ledger-core,
     cardano-ledger-shelley ^>=1.19,
@@ -1040,6 +1041,26 @@ test-suite protocol-test
     serialise,
     tasty,
     tasty-quickcheck,
+
+test-suite fork-mode-protocol-test
+  type: exitcode-stdio-1.0
+  hs-source-dirs: ouroboros-consensus-protocol/test-forkmode
+  main-is: Main.hs
+  default-language: Haskell2010
+  ghc-options:
+    -Wall
+    -threaded
+    -rtsopts
+
+  build-depends:
+    base,
+    bytestring,
+    cardano-crypto-class:cardano-crypto-class,
+    cardano-ledger-core,
+    cardano-protocol,
+    mtl,
+    ouroboros-consensus:protocol,
+    process,
 
 library diffusion
   import: common-lib

@@ -19,6 +19,7 @@ index-state:
   , cardano-haskell-packages 2026-07-30T09:29:13Z
 
 packages: .
+  ../cardano-fork-mode
 
 -- We want to always build the test-suites and benchmarks
 tests: true
